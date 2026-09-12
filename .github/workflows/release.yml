@@ -4,9 +4,27 @@ on:
   push:
     tags:
       - 'v*'
+  # FORK TESTING ONLY - remove before opening the real PR upstream.
+  # Lets this be run by hand against an arbitrary tag without needing to
+  # actually push a git tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build/publish (e.g. v0.9.0-rc.1)'
+        required: true
+        type: string
 
 jobs:
+  # This job used to be delegated to automation-core via workflow_call, but
+  # that binds the OIDC identity used for Vault auth and image attestation
+  # to automation-core's own ref instead of this tag - breaking provenance
+  # verification. It must be defined directly on the tagged branch. See
+  # https://github.com/rancher/backup-restore-operator/pull/1059.
   publish:
+    # FORK TESTING ONLY - skip image building/publishing entirely when
+    # manually testing push-to-rancher; remove this line along with the
+    # rest of the FORK TESTING ONLY changes before opening the real PR.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/rancher/ci-image/charts
@@ -16,8 +34,16 @@ jobs:
       # - OIDC for cosign's use in ecm-distro-tools/publish-image.
       # - Read vault secrets in rancher-eio/read-vault-secrets.
       id-token: write
+    env:
+      # FORK TESTING ONLY - once workflow_dispatch is removed, just use
+      # ${{ github.ref_name }} directly everywhere TAG is referenced below.
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - name : "Read Secrets"
+        # FORK TESTING ONLY - Vault has no secrets provisioned for personal
+        # forks; continue-on-error so the DOCKER_USERNAME/PASSWORD fallbacks
+        # below (vars/secrets set directly on this fork) still get used.
+        continue-on-error: true
         uses : rancher-eio/read-vault-secrets@0da85151ad1f19ed7986c41587e45aac1ace74b6 # v3
         with:
           secrets: |
@@ -34,29 +60,32 @@ jobs:
 
       - name: Check SemVer Characteristics
         id: semver_check
-        uses: rancher/shell/actions/check-semver@automation-core
+        # FORK TESTING ONLY - points at this fork's branch with the fix
+        # instead of rancher/shell@automation-core.
+        uses: diogoasouza/shell/actions/check-semver@refactor-workflow
+        with:
+          tag: ${{ env.TAG }}
       - name: Build and push image to docker.io and Prime Staging Registry
         uses: rancher/ecm-distro-tools/actions/publish-image@8821b2e4aa18f762dc334f811f54e8f215771a68 # v0.66.2
         with:
           image: shell
-          tag: ${{ github.ref_name }}
+          tag: ${{ env.TAG }}
 
           public-registry: docker.io
-          public-repo: rancher
+          # FORK TESTING ONLY - rancher's dockerhub org isn't writable from
+          # this fork's credentials; push under the fork owner's namespace.
+          public-repo: ${{ env.DOCKER_USERNAME || vars.DOCKER_USERNAME || github.repository_owner }}
           public-username: ${{ env.DOCKER_USERNAME || vars.DOCKER_USERNAME || github.repository_owner }}
           public-password: ${{ env.DOCKER_PASSWORD || secrets.DOCKER_PASSWORD }}
 
-          push-to-prime: true
-          prime-registry: ${{ env.PRIME_STG_REGISTRY }}
-          prime-repo: rancher
-          prime-username: ${{ env.PRIME_STG_REGISTRY_USERNAME }}
-          prime-password: ${{ env.PRIME_STG_REGISTRY_PASSWORD }}
+          # FORK TESTING ONLY - no access to Rancher's Prime registries.
+          push-to-prime: false
       - name: Build and push image to Prime Prod Registry
         if: steps.semver_check.outputs.IS_SEMVER == 'true' && steps.semver_check.outputs.HAS_PRERELEASE == 'false'
         uses: rancher/ecm-distro-tools/actions/publish-image@8821b2e4aa18f762dc334f811f54e8f215771a68 # v0.66.2
         with:
           image: shell
-          tag: ${{ github.ref_name }}
+          tag: ${{ env.TAG }}
 
           push-to-public: false
 
@@ -67,15 +96,31 @@ jobs:
           prime-password: ${{ env.PRIME_REGISTRY_PASSWORD }}
 
   push-to-rancher:
-    needs: publish
+    # FORK TESTING ONLY - decoupled from `publish` so this can be tested on
+    # its own without building/pushing an image. Restore `needs: publish`
+    # before opening the real PR.
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/rancher/ci-image/go1.25
     permissions:
       contents: read
       id-token: write
+    env:
+      # FORK TESTING ONLY - see note on the publish job above.
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - name: Push updates to rancher/rancher
-        uses: rancher/shell/actions/push-to-rancher@automation-core
+        # FORK TESTING ONLY - points at this fork's branch with the fix
+        # instead of rancher/shell@automation-core.
+        uses: diogoasouza/shell/actions/push-to-rancher@refactor-workflow
         with:
-          tag: ${{ github.ref_name }}
+          tag: ${{ env.TAG }}
+          # FORK TESTING ONLY - none of the inputs below exist in the
+          # production call: target the fork's rancher instead of the real
+          # one, skip Vault/GitHub App token generation in favor of a PAT
+          # you create yourself (needs push + PR access to your rancher
+          # fork), and skip the check that the shell image actually exists,
+          # since publish was skipped above.
+          target-repo: diogoasouza/rancher
+          github-token: ${{ secrets.RANCHER_FORK_PAT }}
+          skip-image-validation: 'true'
